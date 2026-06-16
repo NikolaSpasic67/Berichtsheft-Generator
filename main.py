@@ -19,13 +19,14 @@ clear_console()
 
 
 # Global Vars
-template_path = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft_Generator\bheft_template.pdf"
-output_dir    = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft_Generator"
+template_path = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator\bheft_template.pdf"
+output_dir    = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator"
 reader = PdfReader(template_path)
 page = reader.pages[0]
 text = page.extract_text()
 current_report_index = 0
 calculate_holidays = False
+calculate_vacation = False
 province = "BW"
 file_name = "Berichtsheft"
 full_name = "Max Mustermann"
@@ -35,7 +36,7 @@ current_department = "PEA6-Fe-FI"
 while True:
 
     # Get all user information. Returns the collected information as a tuple.
-    file_name, full_name, current_department, current_report_index, start_date, end_date, province = get_user_input()
+    file_name, full_name, current_department, current_report_index, start_date, end_date, calculate_holidays, province, vacation_periods_list, calculate_vacation = get_user_input()
 
     # Calculate all workdays between start and end date, excluding weekends. If calculate_holidays is True, 
     # also include holidays based on the selected province.
@@ -49,14 +50,15 @@ while True:
     # Create a summary section to show the user the collected information and calculated workdays, 
     # and ask for confirmation to proceed with report generation. If user confirms, break the loop. 
     # Otherwise, clear the console and repeat the input process.
+    clear_console()
     section("Übersicht")
     info("Dateiname",          file_name,                       C.MAGENTA)
     info("Start Nachweis-Nr.", str(current_report_index),       C.MAGENTA)
     info("Abteilung",         current_department,              C.MAGENTA)
     info("Zeitraum",           f"{start_date}  →  {end_date}",  C.MAGENTA)
     info("Arbeitstage",        str(len(workdays)),              C.MAGENTA)
-    info("Feiertage berücksichtigen?", "Ja" if calculate_holidays else "Nein", C.MAGENTA)
     info("Bundesland für Feiertage", province if calculate_holidays else "N/A", C.MAGENTA)
+    info("Urlaubszeiträume",   ", ".join([f"{start} bis {end}" for period in vacation_periods_list for start, end in period]) if calculate_vacation else "N/A", C.MAGENTA)
 
     section_end()
 
@@ -68,7 +70,8 @@ while True:
 
 
 
-print(f"\n{C.BOLD}{C.CYAN}▶ Generiere Berichtshefte …{C.RESET}\n")
+print()
+subheader("Generiere Berichtshefte …")
 
 
 
@@ -91,6 +94,10 @@ for (year, week), group in df.groupby(["year", "week"]):
         skipped += 1
         continue
 
+    all_holiday_dates = []
+    for period in vacation_periods_list:
+        for start, end in period:
+            all_holiday_dates.extend(pd.date_range(start=start, end=end).tolist())
 
     # Generate the output path for the PDF report based on the file name and current report index.
     output_path = os.path.join(output_dir, f"{file_name}_{current_report_index}.pdf")
@@ -110,10 +117,17 @@ for (year, week), group in df.groupby(["year", "week"]):
     if calculate_holidays:
         week_holidays = holidays.country_holidays("DE", years=[year], subdiv=province)
 
+    # Normalize vacation dates to plain date objects for reliable comparison
+    vacation_dates_set = {d.date() for d in all_holiday_dates}
+
     manipulated_days_texts = ["" for _ in range(5)]
-    for i, single_date in enumerate(all_week_dates):
-        if single_date in week_holidays:
-            manipulated_days_texts[i] = "(Feiertag)"        
+    # Only consider Mon–Fri (first 5 days of the week)
+    for i, single_date in enumerate(all_week_dates[:5]):
+        single_date_only = single_date.date()
+        if calculate_holidays and single_date_only in week_holidays:
+            manipulated_days_texts[i] = "(Feiertag)"
+        elif calculate_vacation and single_date_only in vacation_dates_set:
+            manipulated_days_texts[i] = "(Urlaub)"
 
     # Inject every info into the pdf file form fields
     writer.update_page_form_field_values(
@@ -138,13 +152,13 @@ for (year, week), group in df.groupby(["year", "week"]):
         writer.write(file)
 
     # Print a success message for the generated report
-    print(
-        f"  {C.GREEN}✔{C.RESET} "
-        f"{C.BOLD}Nr. {current_report_index:>3}{C.RESET}  "
-        f"{C.DIM}│{C.RESET} KW {C.CYAN}{int(week):02d}/{int(year)}{C.RESET}  "
-        f"{C.DIM}│{C.RESET} {week_start.strftime('%d.%m.%Y')} "
-        f"{C.DIM}–{C.RESET} {week_end.strftime('%d.%m.%Y')}  "
-        f"{C.DIM}→ {os.path.basename(output_path)}{C.RESET}"
+    report_row(
+        current_report_index,
+        int(week),
+        int(year),
+        week_start,
+        week_end,
+        os.path.basename(output_path),
     )
 
     current_report_index += 1
@@ -157,6 +171,7 @@ section("Zusammenfassung")
 info("Erstellte Berichte",    str(generated), C.GREEN)
 info("Übersprungene Wochen",  str(skipped),   C.YELLOW if skipped else C.GREEN)
 info("Ausgabeverzeichnis",    output_dir,     C.DIM)
+info("Berichtsheft Konfiguration:", f"\n Dateiname: {file_name}\n Voller Name: {full_name}\n Start Nachweis-Nr.: {current_report_index}\n Abteilung: {current_department}\n Zeitraum: {start_date}  →  {end_date}\n Bundesland für Feiertage: {province if calculate_holidays else 'N/A'}\n Urlaubszeiträume: {', '.join([f'{start} bis {end}' for period in vacation_periods_list for start, end in period]) if calculate_vacation else 'N/A'}", C.DIM)
 section_end()
 
 print(
