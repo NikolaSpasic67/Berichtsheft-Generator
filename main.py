@@ -1,135 +1,269 @@
-import json
+"""Pure-logic report generator for Berichtsheft PDFs.
+
+This module contains no terminal I/O. It exposes a single high-level
+entry point :func:`generate_reports` that takes a :class:`ReportConfig`
+and produces PDF files plus a :class:`ReportResult` summary. A tkinter
+(or any other) GUI can call it directly.
+"""
+
+from __future__ import annotations
+
 import os
-import pandas as pd
-from pypdf import PdfReader
-from pypdf import PdfWriter
-from datetime import datetime
+from dataclasses import dataclass, field
 from datetime import date
-from helper_functions import *
+from typing import Callable, Optional
+
 import holidays
+import pandas as pd
+from pypdf import PdfReader, PdfWriter
 
-# --- Terminal Styling (ANSI) -------------------------------------------------
-# Aktiviert ANSI-Escape-Sequenzen unter Windows (10+), damit Farben & Stile
-# auch in der klassischen Konsole funktionieren.
-# NTUser for name
-
-if os.name == "nt":
-    os.system("")
-clear_console()
+from helper_functions import expand_vacation_dates
 
 
-# Global Vars
-template_path = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator\bheft_template.pdf"
-output_dir    = r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator"
-reader = PdfReader(template_path)
-page = reader.pages[0]
-text = page.extract_text()
-current_report_index = 0
-calculate_holidays = False
-calculate_vacation = False
-province = "BW"
-file_name = "Berichtsheft"
-full_name = "Max Mustermann"
-current_department = "PEA6-Fe-FI"
+# ---------------------------------------------------------------------------
+# Defaults (can be overridden via ReportConfig)
+# ---------------------------------------------------------------------------
 
-# Main loop to collect user input, ask for confirmation and clear console for next steps. Repeats until user confirms.
-while True:
+DEFAULT_TEMPLATE_PATH = (
+    r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator"
+    r"\bheft_template.pdf"
+)
+DEFAULT_OUTPUT_DIR = (
+    r"C:\Users\PVV1FE\Documents\Projects\Python\Berichtsheft-Generator"
+)
 
-    # Get all user information. Returns the collected information as a tuple.
-    file_name, full_name, current_department, current_report_index, start_date, end_date, calculate_holidays, province, vacation_periods_list, calculate_vacation = get_user_input()
 
-    # Calculate all workdays between start and end date, excluding weekends. If calculate_holidays is True, 
-    # also include holidays based on the selected province.
-    workdays = pd.bdate_range(start=start_date, end=end_date)
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
-    # Create a DataFrame from the workdays to easily group by week and year later. Extract week number and year for each date.
+@dataclass
+class ReportConfig:
+    """All inputs required to generate a batch of weekly reports."""
+
+    full_name: str
+    current_department: str
+    start_report_index: int
+    start_date: date
+    end_date: date
+
+    file_name: str = "Berichtsheft"
+    template_path: str = DEFAULT_TEMPLATE_PATH
+    output_dir: str = DEFAULT_OUTPUT_DIR
+
+    calculate_holidays: bool = False
+    province: str = "BW"
+
+    calculate_vacation: bool = False
+    vacation_periods: list[tuple[date, date]] = field(default_factory=list)
+
+
+@dataclass
+class GeneratedReport:
+    """Information about a single successfully generated report file."""
+
+    index: int
+    week: int
+    year: int
+    week_start: date
+    week_end: date
+    file_path: str
+
+
+@dataclass
+class SkippedWeek:
+    """A week that was skipped during generation, with a reason."""
+
+    week: int
+    year: int
+    reason: str
+
+
+@dataclass
+class ReportResult:
+    """Aggregated outcome of a :func:`generate_reports` run."""
+
+    generated_reports: list[GeneratedReport] = field(default_factory=list)
+    skipped_weeks: list[SkippedWeek] = field(default_factory=list)
+    next_report_index: int = 0
+
+    @property
+    def generated_count(self) -> int:
+        return len(self.generated_reports)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_weeks)
+
+
+# Optional callback signature: called once per processed week.
+# Args: (current_week_number_1based, total_weeks, message)
+ProgressCallback = Callable[[int, int, str], None]
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+def generate_reports(
+    config: ReportConfig,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> ReportResult:
+    """Generate one PDF per complete work week in the configured range.
+
+    Parameters
+    ----------
+    config:
+        Fully populated :class:`ReportConfig`.
+    progress_callback:
+        Optional callable invoked after each week is processed (whether
+        generated or skipped). Useful for driving a GUI progress bar.
+
+    Returns
+    -------
+    ReportResult
+        Summary of generated files, skipped weeks and the next free
+        report index after the run.
+    """
+    _validate_config(config)
+
+    workdays = pd.bdate_range(start=config.start_date, end=config.end_date)
     df = pd.DataFrame({"date": workdays})
     df["week"] = df["date"].dt.isocalendar().week
     df["year"] = df["date"].dt.isocalendar().year
 
-    # Create a summary section to show the user the collected information and calculated workdays, 
-    # and ask for confirmation to proceed with report generation. If user confirms, break the loop. 
-    # Otherwise, clear the console and repeat the input process.
-    clear_console()
-    section("Übersicht")
-    info("Dateiname",          file_name,                       C.MAGENTA)
-    info("Start Nachweis-Nr.", str(current_report_index),       C.MAGENTA)
-    info("Abteilung",         current_department,              C.MAGENTA)
-    info("Zeitraum",           f"{start_date}  →  {end_date}",  C.MAGENTA)
-    info("Arbeitstage",        str(len(workdays)),              C.MAGENTA)
-    info("Bundesland für Feiertage", province if calculate_holidays else "N/A", C.MAGENTA)
-    info("Urlaubszeiträume",   ", ".join([f"{start} bis {end}" for period in vacation_periods_list for start, end in period]) if calculate_vacation else "N/A", C.MAGENTA)
+    vacation_dates: set[date] = (
+        expand_vacation_dates(config.vacation_periods)
+        if config.calculate_vacation
+        else set()
+    )
 
-    section_end()
+    grouped = list(df.groupby(["year", "week"]))
+    total_weeks = len(grouped)
 
-    # Confirmation dialog: Waits for ENTER (True) or ESC (False). Ignores key-release events.
-    if ask_confirm():
-        clear_console()
-        break
-    clear_console()
+    result = ReportResult(next_report_index=config.start_report_index)
+    current_index = config.start_report_index
+
+    for step, ((year, week), group) in enumerate(grouped, start=1):
+        week_start = group["date"].min().date()
+        week_end = group["date"].max().date()
+        days_in_week = (week_end - week_start).days + 1
+
+        if days_in_week < 5:
+            skipped = SkippedWeek(
+                week=int(week),
+                year=int(year),
+                reason="keine vollständige Woche",
+            )
+            result.skipped_weeks.append(skipped)
+            if progress_callback is not None:
+                progress_callback(
+                    step,
+                    total_weeks,
+                    f"KW {int(week):02d}/{int(year)} übersprungen "
+                    f"({skipped.reason})",
+                )
+            continue
+
+        week_holidays: set[date] = set()
+        if config.calculate_holidays:
+            week_holidays = set(
+                holidays.country_holidays(
+                    "DE", years=[int(year)], subdiv=config.province
+                )
+            )
+
+        all_week_dates = pd.date_range(start=week_start, end=week_end)
+        manipulated_days_texts = ["" for _ in range(5)]
+        for i, single_date in enumerate(all_week_dates[:5]):
+            single_date_only = single_date.date()
+            if config.calculate_holidays and single_date_only in week_holidays:
+                manipulated_days_texts[i] = "(Feiertag)"
+            elif config.calculate_vacation and single_date_only in vacation_dates:
+                manipulated_days_texts[i] = "(Urlaub)"
+
+        output_path = os.path.join(
+            config.output_dir, f"{config.file_name}_{current_index}.pdf"
+        )
+        _write_pdf(
+            template_path=config.template_path,
+            output_path=output_path,
+            full_name=config.full_name,
+            department=config.current_department,
+            report_index=current_index,
+            week_start=week_start,
+            week_end=week_end,
+            manipulated_days_texts=manipulated_days_texts,
+        )
+
+        report = GeneratedReport(
+            index=current_index,
+            week=int(week),
+            year=int(year),
+            week_start=week_start,
+            week_end=week_end,
+            file_path=output_path,
+        )
+        result.generated_reports.append(report)
+
+        if progress_callback is not None:
+            progress_callback(
+                step,
+                total_weeks,
+                f"KW {int(week):02d}/{int(year)} → {os.path.basename(output_path)}",
+            )
+
+        current_index += 1
+
+    result.next_report_index = current_index
+    return result
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-print()
-subheader("Generiere Berichtshefte …")
+def _validate_config(config: ReportConfig) -> None:
+    """Raise ``ValueError`` / ``FileNotFoundError`` for invalid inputs."""
+    if not os.path.isfile(config.template_path):
+        raise FileNotFoundError(
+            f"Template-Datei nicht gefunden: {config.template_path}"
+        )
+    if not os.path.isdir(config.output_dir):
+        raise FileNotFoundError(
+            f"Ausgabeverzeichnis existiert nicht: {config.output_dir}"
+        )
+    if config.start_date > config.end_date:
+        raise ValueError(
+            f"Startdatum {config.start_date} liegt nach Enddatum {config.end_date}."
+        )
+    if not config.full_name.strip():
+        raise ValueError("Vollständiger Name darf nicht leer sein.")
+    if not config.file_name.strip():
+        raise ValueError("Dateiname darf nicht leer sein.")
+    if not config.current_department.strip():
+        raise ValueError("Abteilung darf nicht leer sein.")
+    if config.start_report_index < 0:
+        raise ValueError("Start-Nachweis-Nr. darf nicht negativ sein.")
 
 
-
-# Main Loop for PDF generation: Groups the DataFrame by week and year, checks for complete weeks (at least 5 workdays),
-# and generates a PDF report files for each complete week using the template. If calculate_holidays is True, 
-# it also checks for holidays in the week and markes them on their respective days. Keeps track of generated and skipped reports for the final summary.
-
-generated = 0
-skipped   = 0
-
-for (year, week), group in df.groupby(["year", "week"]):
-
-    # Extract start and end date of the week, and create a list of all dates in that week. Check if the week has at least 5 workdays, otherwise skip it.
-    week_start = group["date"].min()
-    week_end   = group["date"].max()
-    all_week_dates = pd.date_range(start=week_start, end=week_end)
-    days_in_week = (week_end - week_start).days + 1
-    if days_in_week < 5:
-        warn(f"KW {int(week):02d}/{int(year)}: keine vollständige Woche – übersprungen")
-        skipped += 1
-        continue
-
-    all_holiday_dates = []
-    for period in vacation_periods_list:
-        for start, end in period:
-            all_holiday_dates.extend(pd.date_range(start=start, end=end).tolist())
-
-    # Generate the output path for the PDF report based on the file name and current report index.
-    output_path = os.path.join(output_dir, f"{file_name}_{current_report_index}.pdf")
-
-    # Define pdf reader and writer, read the template and get all neede form fields.
+def _write_pdf(
+    *,
+    template_path: str,
+    output_path: str,
+    full_name: str,
+    department: str,
+    report_index: int,
+    week_start: date,
+    week_end: date,
+    manipulated_days_texts: list[str],
+) -> None:
+    """Fill in the PDF form template for one week and write the result."""
     reader = PdfReader(template_path)
     writer = PdfWriter()
     writer.clone_reader_document_root(reader)
     writer.set_need_appearances_writer(True)
-    fields = reader.get_fields()
 
-
-    # If calculate_holidays is true, get all holidays for the current year and selected province,
-    # then check if any of the dates in the current week are holidays, and mark the days with (Feiertag)
-    
-    week_holidays = []
-    if calculate_holidays:
-        week_holidays = holidays.country_holidays("DE", years=[year], subdiv=province)
-
-    # Normalize vacation dates to plain date objects for reliable comparison
-    vacation_dates_set = {d.date() for d in all_holiday_dates}
-
-    manipulated_days_texts = ["" for _ in range(5)]
-    # Only consider Mon–Fri (first 5 days of the week)
-    for i, single_date in enumerate(all_week_dates[:5]):
-        single_date_only = single_date.date()
-        if calculate_holidays and single_date_only in week_holidays:
-            manipulated_days_texts[i] = "(Feiertag)"
-        elif calculate_vacation and single_date_only in vacation_dates_set:
-            manipulated_days_texts[i] = "(Urlaub)"
-
-    # Inject every info into the pdf file form fields
     writer.update_page_form_field_values(
         writer.pages[0],
         {
@@ -137,44 +271,18 @@ for (year, week), group in df.groupby(["year", "week"]):
             "Date2_af_date": week_end.strftime("%d.%m.%Y"),
             "Date5_af_date": week_end.strftime("%d.%m.%Y"),
             "Text3": str(full_name),
-            "Text4": str(current_report_index),
-            "Text12": str(current_department),
-            "Text6": f"Montag: {manipulated_days_texts[0]}\n\n"
-                     f"Dienstag: {manipulated_days_texts[1]}\n\n"
-                     f"Mittwoch: {manipulated_days_texts[2]}\n\n"
-                     f"Donnerstag: {manipulated_days_texts[3]}\n\n"
-                     f"Freitag: {manipulated_days_texts[4]}",
+            "Text4": str(report_index),
+            "Text12": str(department),
+            "Text6": (
+                f"Montag: {manipulated_days_texts[0]}\n\n"
+                f"Dienstag: {manipulated_days_texts[1]}\n\n"
+                f"Mittwoch: {manipulated_days_texts[2]}\n\n"
+                f"Donnerstag: {manipulated_days_texts[3]}\n\n"
+                f"Freitag: {manipulated_days_texts[4]}"
+            ),
         },
     )
 
-    # Write the modified PDF to the output path.
     with open(output_path, "wb") as file:
         writer.write(file)
 
-    # Print a success message for the generated report
-    report_row(
-        current_report_index,
-        int(week),
-        int(year),
-        week_start,
-        week_end,
-        os.path.basename(output_path),
-    )
-
-    current_report_index += 1
-    generated += 1
-
-
-# After processing all weeks, clear the console and print a summary of generated reports, skipped weeks and output directory.
-clear_console()
-section("Zusammenfassung")
-info("Erstellte Berichte",    str(generated), C.GREEN)
-info("Übersprungene Wochen",  str(skipped),   C.YELLOW if skipped else C.GREEN)
-info("Ausgabeverzeichnis",    output_dir,     C.DIM)
-info("Berichtsheft Konfiguration:", f"\n Dateiname: {file_name}\n Voller Name: {full_name}\n Start Nachweis-Nr.: {current_report_index}\n Abteilung: {current_department}\n Zeitraum: {start_date}  →  {end_date}\n Bundesland für Feiertage: {province if calculate_holidays else 'N/A'}\n Urlaubszeiträume: {', '.join([f'{start} bis {end}' for period in vacation_periods_list for start, end in period]) if calculate_vacation else 'N/A'}", C.DIM)
-section_end()
-
-print(
-    f"\n{C.GREEN}{C.BOLD}✔ Fertig!{C.RESET} "
-    f"{C.DIM}{generated} Berichtsheft(e) erfolgreich generiert.{C.RESET}\n"
-)
